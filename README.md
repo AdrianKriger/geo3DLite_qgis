@@ -1,15 +1,11 @@
-<<<<<<< HEAD
 # *geo3DLite* (QGIS)
-3D City Models &amp; Spatial Data Science for Geography and Sustainable Development Education in QGIS
-=======
-# geo3DLite (QGIS)
 
 *geo3DLite* is a dependency-free, educational variant of [*geo3D*](https://github.com/AdrianKriger/geo3D) designed to run entirely within [QGIS](https://qgis.org). It focuses on spatial reasoning and interactive exploration at the village and suburb scale.
 
-**Core Characteristics*
+**Core Characteristics**
 - QGIS-Native: No Conda, no Docker, nor external Python libraries required.
 - Interactive-Only: Designed for exploratory analysis and workshops, not production.
-- Local: Optimized for villages and neighbourhoods.
+- Local, Place-based Learning: Optimized for villages and neighbourhoods.
 - Didactic: Prioritizes transparency and learning over automated production.
 
 **Use Cases**
@@ -18,14 +14,10 @@
 - Low-resource or offline-only environments.
 
 **What it is NOT**
-*geo3DLite* is not a tool for generating topologically correct, semantially rich LoD1+ City Models. For simulation ready (wind comfort factor, energy demand, etc.) models, use the geo3D
+*geo3DLite* is not a tool for generating topologically correct, semantially rich LoD1+ City Models. For simulation ready (wind comfort factor, energy demand, etc.) models, you are welcome to [*geo3D*](https://github.com/AdrianKriger/geo3D)
 
 **Requirements**
-QGIS (Current LTR recommended) with the [opengeos](https://github.com/opengeos) [QGIS Notebook Plugin](https://plugins.qgis.org/plugins/qgis_notebook/) installed.
->>>>>>> d3ba7fa (rename + readme)
-
-To execute these notebooks within [QGIS](https://qgis.org); you will need to have the [opengeos](https://github.com/opengeos) [QGIS Notebook Plugin](https://plugins.qgis.org/plugins/qgis_notebook/) installed.
-
+- QGIS (Current LTR recommended) with the [opengeos](https://github.com/opengeos) [QGIS Notebook Plugin](https://plugins.qgis.org/plugins/qgis_notebook/) installed.
 ___
 
 <p align="center">There are two processing options:</p>
