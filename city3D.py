@@ -14,7 +14,7 @@ from qgis.core import (
     QgsField, QgsProject, QgsDistanceArea, QgsCoordinateTransform, QgsFeatureRequest,
     QgsCoordinateReferenceSystem, QgsGeometry, QgsVariantUtils, QgsVectorLayer, QgsVectorFileWriter,
     QgsLineSymbol, QgsSingleSymbolRenderer, QgsMapLayer, QgsCoordinateTransformContext,
-    NULL, QgsField
+    NULL, QgsField, QgsFeature
 )
 from qgis.PyQt.QtCore import QEventLoop, QUrl
 from qgis.PyQt.QtNetwork import QNetworkAccessManager, QNetworkRequest
@@ -748,7 +748,12 @@ def read_vsimem_geojson(vsimem_path):
     gdf = gdf.set_crs("EPSG:4326", allow_override=True)
     return gdf
 
-def _harvestSolar(input_pbf, aoi_layer, epsg):
+def _harvestSolar(input_pbf, focus, aoi_layer, epsg):
+    """
+    Harvests solar data. 
+    Returns: GeoDataFrame in projected CRS (epsg).
+    Displays: QGIS Memory Layer in WGS84 (EPSG:4326).
+    """
     gdal.UseExceptions()
     gdal.SetConfigOption("OGR_GEOMETRY_ACCEPT_UNCLOSED_RING", "NO")
     gdal.SetConfigOption("OGR_INTERLEAVED_READING", "YES")
@@ -757,71 +762,74 @@ def _harvestSolar(input_pbf, aoi_layer, epsg):
         other_tags LIKE '%"power"=>"generator"%'
         AND other_tags LIKE '%"generator:source"=>"solar"%'
     """
-    #- get extent for the initial GDAL harvesting (fast)
+
+    # Get extent for GDAL harvesting
     extent = aoi_layer.extent()
     minx, miny = extent.xMinimum(), extent.yMinimum()
     maxx, maxy = extent.xMaximum(), extent.yMaximum()
     
     all_solar_gdfs = []
 
-    # --- 1. multipolygons ---
+    # --- 1. Process Multipolygons ---
     geojson_poly = "/vsimem/solar_multipolygons.geojson"
-
     gdal.VectorTranslate(
-        geojson_poly,
-        input_pbf,
-        format="GeoJSON",
-        layers=["multipolygons"],
-        options=[
-            "-where", sql_where_solar_generator,
-            "-makevalid",
-            "-spat", str(minx), str(miny), str(maxx), str(maxy),
-        ]
+        geojson_poly, input_pbf, format="GeoJSON", layers=["multipolygons"],
+        options=["-where", sql_where_solar_generator, "-makevalid",
+                 "-spat", str(minx), str(miny), str(maxx), str(maxy)]
     )
-
     gdf_poly = read_vsimem_geojson(geojson_poly)
-    if not gdf_poly.empty:
-        all_solar_gdfs.append(gdf_poly)
+    if not gdf_poly.empty: all_solar_gdfs.append(gdf_poly)
 
-    # --- 2. lines (closed ways as polygons) ---
+    # --- 2. Process Lines ---
     geojson_lines = "/vsimem/solar_lines.geojson"
-
     gdal.VectorTranslate(
-        geojson_lines,
-        input_pbf,
-        format="GeoJSON",
-        layers=["lines"],
-        options=[
-            "-where", sql_where_solar_generator,
-            "-makevalid",
-            "-spat", str(minx), str(miny), str(maxx), str(maxy),
-            "-nlt", "POLYGON",
-        ]
+        geojson_lines, input_pbf, format="GeoJSON", layers=["lines"],
+        options=["-where", sql_where_solar_generator, "-makevalid",
+                 "-spat", str(minx), str(miny), str(maxx), str(maxy), "-nlt", "POLYGON"]
     )
-
     gdf_lines = read_vsimem_geojson(geojson_lines)
-    if not gdf_lines.empty:
-        all_solar_gdfs.append(gdf_lines)
+    if not gdf_lines.empty: all_solar_gdfs.append(gdf_lines)
 
-    # --- 3. combine ---
+    # --- 3. Combine and Cleanup GDAL ---
     if not all_solar_gdfs:
         gdal.Unlink(geojson_poly)
         gdal.Unlink(geojson_lines)
-        return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+        return gpd.GeoDataFrame(geometry=[], crs=epsg)
 
-    gdf_solar = gpd.GeoDataFrame(
-        pd.concat(all_solar_gdfs, ignore_index=True),
-        crs="EPSG:4326"
-    )
+    # This is our base data in WGS84 (OSM default)
+    gdf_wgs84 = gpd.GeoDataFrame(pd.concat(all_solar_gdfs, ignore_index=True), crs="EPSG:4326")
 
-    # Reproject to working CRS
-    gdf_solar = gdf_solar.to_crs(epsg)
-
-    # Cleanup
     gdal.Unlink(geojson_poly)
     gdal.Unlink(geojson_lines)
 
-    return gdf_solar
+    # --- 4. Add to QGIS Map View (WGS84) ---
+    layer_name = f"Solar_{focus}"
+    _remove_layer_by_name(layer_name)
+
+    # Create memory layer specifically in 4326
+    uri = "Polygon?crs=EPSG:4326"
+    temp_layer = QgsVectorLayer(uri, layer_name, "memory")
+    provider = temp_layer.dataProvider()
+
+    cols = [column for column in gdf_wgs84.columns if column != 'geometry']
+    provider.addAttributes([QgsField(str(name), QVariant.String) for name in cols])
+    temp_layer.updateFields()
+
+    features = []
+    for _, row in gdf_wgs84.iterrows():
+        if row.geometry:
+            fet = QgsFeature()
+            fet.setGeometry(QgsGeometry.fromWkt(row.geometry.wkt))
+            fet.setAttributes([str(row[name]) if pd.notnull(row[name]) else None for name in cols])
+            features.append(fet)
+
+    provider.addFeatures(features)
+    QgsProject.instance().addMapLayer(temp_layer)
+
+    # --- 5. Return projected GeoDataFrame (UTM/EPSG) ---
+    gdf_projected = gdf_wgs84.to_crs(epsg)
+    
+    return gdf_projected
 
 def calculate_azimuth_from_geometry(polygon):
     """
