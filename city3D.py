@@ -9,6 +9,7 @@ import re
 import numpy as np
 import pandas as pd
 import geopandas as gpd
+import shapely.wkt
 
 from qgis.core import (
     QgsField, QgsProject, QgsDistanceArea, QgsCoordinateTransform, QgsFeatureRequest,
@@ -99,7 +100,7 @@ def _parse_to_geojson(raw_data, geom_type="Polygon"):
 
 def overpass2qgis(large, focus, zoom=True):
     """Harvest buildings and add to project."""
-    name = f"Buildings_{focus}"
+    name = f"buildings_{focus}"
     query = (f'[out:json][timeout:180];area[name="{large}"]->.L;area[name="{focus}"](area.L)->.a;(way["building"](area.a);relation["building"]["type"="multipolygon"](area.a););out geom;')
     data = _fetch_overpass(query)
     vlayer = QgsVectorLayer(json.dumps(_parse_to_geojson(data, "Polygon")), name, "ogr")
@@ -469,9 +470,117 @@ def extract_blds(input_pbf, focus, aoi_layer):
 
     return final_blds
 
+def harvest_osm_to_qgis(input_pbf, layer_type, sql_where, aoi_layer, base_name, focus):
+    """
+    Generic QGIS Harvester for geo3DLite.
+    Names layers as: BaseName_Focus (e.g., Buildings_CapeTown)
+    """
+    gdal.UseExceptions()
+    
+    # 1. Standardized Naming
+    target_layer_name = f"{base_name}_{focus}" 
+    geojson_vsimem = f"/vsimem/temp_{target_layer_name}.geojson"
+    
+    # Clean up existing layer to prevent duplicates
+    _remove_layer_by_name(target_layer_name)
+
+    # 2. Extent for GDAL
+    ext = aoi_layer.extent()
+    options = [
+        "-where", sql_where,
+        "-makevalid",
+        "-spat", str(ext.xMinimum()), str(ext.yMinimum()), 
+        str(ext.xMaximum()), str(ext.yMaximum())
+    ]
+
+    try:
+        # 3. GDAL Extract
+        gdal.VectorTranslate(geojson_vsimem, input_pbf, format="GeoJSON", 
+                             layers=[layer_type], options=options)
+        
+        raw_layer = QgsVectorLayer(geojson_vsimem, "raw_harvest", "ogr")
+        
+        if not raw_layer.isValid() or raw_layer.featureCount() == 0:
+            return None
+
+        # 4. Irregular Clip
+        clipped_result = processing.run("native:clip", {
+            'INPUT': raw_layer,
+            'OVERLAY': aoi_layer,
+            'OUTPUT': 'memory:'
+        })
+        
+        final_layer = clipped_result['OUTPUT']
+        final_layer.setName(target_layer_name)
+
+        # 5. Tag/ID Parsing
+        final_layer = process_osm_tags_and_ids(final_layer)
+
+        # 6. Add to Project
+        QgsProject.instance().addMapLayer(final_layer)
+        return final_layer
+
+    except Exception as e:
+        print(f"Error harvesting {target_layer_name}: {e}")
+        return None
+    finally:
+        if gdal.VSIStatL(geojson_vsimem):
+            gdal.Unlink(geojson_vsimem)
+
+
+def harvest_water_to_qgis(input_pbf, aoi_layer, focus):
+    """
+    Merges Multipolygons and Lines into one true Temporary Scratch 'Water' layer.
+    """
+    target_name = f"Water_{focus}"
+    _remove_layer_by_name(target_name)
+
+    # 1. Harvest silently (No project addition)
+    # Ensure harvest_osm_to_qgis is updated with the add_to_project=False flag
+    poly_layer = harvest_osm_to_qgis(
+        input_pbf, "multipolygons", "natural='water' OR landuse='reservoir'", 
+        aoi_layer, "temp_poly", focus, add_to_project=False
+    )
+
+    line_layer = harvest_osm_to_qgis(
+        input_pbf, "lines", "waterway IS NOT NULL", 
+        aoi_layer, "temp_line", focus, add_to_project=False
+    )
+
+    layers_to_merge = [l for l in [poly_layer, line_layer] if l is not None]
+    if not layers_to_merge:
+        return None
+
+    # 2. Perform the Merge
+    # We merge to memory, but then we "Cast" it to a fresh Scratch layer
+    merge_result = processing.run("native:mergevectorlayers", {
+        'LAYERS': layers_to_merge,
+        'OUTPUT': 'memory:'
+    })
+    merged_data = merge_result['OUTPUT']
+
+    # 3. Create the ACTUAL Temporary Scratch Layer
+    # This URI format is what QGIS uses for 'Scratch' layers
+    uri = f"Polygon?crs={aoi_layer.crs().authid()}"
+    water_scratch = QgsVectorLayer(uri, target_name, "memory")
+    provider = water_scratch.dataProvider()
+
+    # Copy fields and features from the merge result
+    provider.addAttributes(merged_data.fields())
+    water_scratch.updateFields()
+    
+    # Efficiently add features
+    features = [f for f in merged_data.getFeatures()]
+    provider.addFeatures(features)
+
+    # 4. Add to Project
+    QgsProject.instance().addMapLayer(water_scratch)
+    
+    return water_scratch
+
 def q_farmland(large, focus):
     """Harvest landuse=farmland and add to project."""
-    name = f"Farmland_{focus}"
+    name = f"farmland_{focus}"
     query = (f'[out:json][timeout:180];area[name="{large}"]->.L;area[name="{focus}"](area.L)->.a;(way["landuse"="farmland"](area.a);relation["landuse"="farmland"]["type"="multipolygon"](area.a););out geom;')
     data = _fetch_overpass(query)
     vlayer = QgsVectorLayer(json.dumps(_parse_to_geojson(data, "Polygon")), name, "ogr")
@@ -485,10 +594,10 @@ def q_farmland(large, focus):
     else:
         print(f"Skipped {name}: No features found.")
         return None
-
+        
 def q_green_spaces(large, focus):
     """Harvest leisure areas and add to project."""
-    name = f"GreenSpaces_{focus}"
+    name = f"greenSpace_{focus}"
     query = (f'[out:json][timeout:180];area[name="{large}"]->.L;area[name="{focus}"](area.L)->.a;(way["leisure"~"park|track|pitch"](area.a);relation["leisure"~"park|track|pitch"]["type"="multipolygon"](area.a););out geom;')
     data = _fetch_overpass(query)
     vlayer = QgsVectorLayer(json.dumps(_parse_to_geojson(data, "Polygon")), name, "ogr")
@@ -504,22 +613,66 @@ def q_green_spaces(large, focus):
         return None
 
 def q_water(large, focus):
-    """Harvest water features and add to project."""
-    name = f"Water_{focus}"
-    query = (f'[out:json][timeout:180];area[name="{large}"]->.L;area[name="{focus}"](area.L)->.a;(way["water"](area.a);way["waterway"="stream"](area.a);relation["water"]["type"="multipolygon"](area.a););out geom;')
-    data = _fetch_overpass(query)
-    vlayer = QgsVectorLayer(json.dumps(_parse_to_geojson(data, "Polygon")), name, "ogr")
-    final = vlayer.materialize(QgsFeatureRequest())
-    
+    """Harvest water features, buffer lines, and return a single Polygon scratch layer."""
+    name = f"water_{focus}"
     _remove_layer_by_name(name)
-    # Check if dataset is not empty before adding
-    if final.featureCount() > 0:
-        QgsProject.instance().addMapLayer(final)
-        return final
-    else:
-        print(f"Skipped {name}: No features found.")
+
+    query = (f'[out:json][timeout:180];area[name="{large}"]->.L;'
+             f'area[name="{focus}"](area.L)->.a;'
+             f'(way["water"](area.a);'
+             f'way["waterway"](area.a);'
+             f'relation["water"]["type"="multipolygon"](area.a););out geom;')
+    
+    data = _fetch_overpass(query)
+    if not data or not data.get('elements'):
         return None
-    return final
+
+    # 1. Parse everything as raw features first
+    # Use 'LineString' to capture the actual geometry of the ways
+    raw_geojson = _parse_to_geojson(data, "LineString")
+    gdf_raw = gpd.GeoDataFrame.from_features(raw_geojson['features'], crs="EPSG:4326")
+
+    # 2. Separate by Geometry Type
+    # This ensures we don't treat a river as a polygon unless it's a closed loop
+    gdf_line = gdf_raw[gdf_raw.geometry.type == 'LineString'].copy()
+    gdf_poly = gdf_raw[gdf_raw.geometry.type == 'Polygon'].copy()
+
+    # 3. Buffer ONLY the lines
+    # This turns the 32 lines into real water surfaces without 'snapping' start to end
+    if not gdf_line.empty:
+        # 0.00005 degrees is approx 1m width
+        gdf_line['geometry'] = gdf_line.geometry.buffer(0.00001)
+
+    # 4. Merge them back together
+    # Now both are Polygons, but the rivers are the correct shape
+    gdf_water = pd.concat([gdf_poly, gdf_line], ignore_index=True)
+
+    if gdf_water.empty:
+        return None
+
+    # 5. Create the TRUE Temporary Scratch Layer in QGIS
+    uri = f"Polygon?crs=EPSG:4326"
+    water_layer = QgsVectorLayer(uri, name, "memory")
+    provider = water_layer.dataProvider()
+
+    # Add attributes from GDF (excluding geometry)
+    cols = [c for c in gdf_water.columns if c != 'geometry']
+    provider.addAttributes([QgsField(str(n), QVariant.String) for n in cols])
+    water_layer.updateFields()
+
+    # Convert features
+    features = []
+    for _, row in gdf_water.iterrows():
+        if row.geometry and not row.geometry.is_empty:
+            fet = QgsFeature()
+            fet.setGeometry(QgsGeometry.fromWkt(row.geometry.wkt))
+            fet.setAttributes([str(row[n]) if pd.notnull(row[n]) else None for n in cols])
+            features.append(fet)
+
+    provider.addFeatures(features)
+    QgsProject.instance().addMapLayer(water_layer)
+    
+    return water_layer
 
 def hex_to_rgb(h):
     h = h.lstrip("#")
@@ -527,7 +680,7 @@ def hex_to_rgb(h):
 
 def q_Troutes(large, operator='MyCiTi'):
     """Harvest bus routes and apply original RGB tuple conversion."""
-    name = f"Transit_{operator}"
+    name = f"transit{operator}"
     query = (f'[out:json][timeout:180];area[name="{large}"];(relation["type"="route"]["route"="bus"]["operator"="{operator}"]["colour"](area););out geom;')
     
     data = _fetch_overpass(query)
@@ -572,36 +725,73 @@ def layer_to_geojson_dict(layer):
     return data
 
 
-def create_3Dviz(result_dir, buildings_layer, farmland_layer=None, green_layer=None, water_layer=None, bus_layer=None):
-    html_path = os.path.join(result_dir, "interactiveOnly.html")
+def create_3Dviz(
+    result_dir, 
+    buildings_layer, 
+    roads_layer=None, 
+    green_layer=None, 
+    water_layer=None, 
+    bus_layer=None, 
+    offline=False,
+    local_js_path="./data/maplibre-gl.js", 
+    local_css_path="./data/maplibre-gl.css"
+):
+    """
+    Creates a 3D MapLibre visualization. 
+    If offline=True, it embeds local JS/CSS and uses a solid dark background.
+    """
+    if offline == False:
+        html_path = os.path.join(result_dir, "interactiveOnly.html")
+    else:
+        html_path = os.path.join(result_dir, "interactiveAlt.html")
+    #html_path = os.path.join(result_dir, f"geo3D_{focus}.html")
     
-    # 1. Convert layers to GeoJSON Data
+    # 1. Convert QGIS Layers to GeoJSON Dicts
+    # Assumes layer_to_geojson_dict is available in your namespace
     building_data = layer_to_geojson_dict(buildings_layer)
+    road_data = layer_to_geojson_dict(roads_layer) if roads_layer else {"type": "FeatureCollection", "features": []}
     green_data = layer_to_geojson_dict(green_layer) if green_layer else {"type": "FeatureCollection", "features": []}
-    farmland_data = layer_to_geojson_dict(farmland_layer) if farmland_layer else {"type": "FeatureCollection", "features": []}
     water_data = layer_to_geojson_dict(water_layer) if water_layer else {"type": "FeatureCollection", "features": []}
     bus_data = layer_to_geojson_dict(bus_layer) if bus_layer else {"type": "FeatureCollection", "features": []}
 
-    # 2. Get Map Center
+    # 2. Map View Settings
     extent = buildings_layer.extent()
-    center_coords = [
-        (extent.xMinimum() + extent.xMaximum()) / 2,
-        (extent.yMinimum() + extent.yMaximum()) / 2
-    ]
+    center_coords = [(extent.xMinimum() + extent.xMaximum()) / 2, (extent.yMinimum() + extent.yMaximum()) / 2]
 
-    # 3. HTML Content
+    # 3. Asset & Style Logic
+    if offline:
+        try:
+            with open(local_js_path, 'r', encoding='utf-8') as f:
+                js_content = f"<script>{f.read()}</script>"
+            with open(local_css_path, 'r', encoding='utf-8') as f:
+                css_content = f"<style>{f.read()}</style>"
+        except FileNotFoundError:
+            js_content = '<script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>'
+            css_content = '<link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />'
+
+        style_js = json.dumps({
+            "version": 8,
+            "sources": {},
+            "layers": [{"id":"bg","type":"background","paint":{"background-color":"#0e0e0e"}}]
+        })
+    else:
+        js_content = '<script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>'
+        css_content = '<link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />'
+        style_js = "'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json'"
+        
+    # 4. Generate HTML
     html_content = f"""
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8" />
-    <title>geo3D – Interactive City</title>
-    <script src="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.js"></script>
-    <link href="https://unpkg.com/maplibre-gl@3.6.2/dist/maplibre-gl.css" rel="stylesheet" />
+    <title>geo3DLite (QGIS). 3D City Models for Geography and Sustainable Development Education</title>
+    {css_content}
+    {js_content}
     <style>
         body {{ margin: 0; padding: 0; }}
-        #map {{ position: absolute; top: 0; bottom: 0; width: 100%; }}
-        .popup-content {{ font-size: 13px; line-height: 1.45; font-family: sans-serif; }}
+        #map {{ position: absolute; top: 0; bottom: 0; width: 100%; background: #0e0e0e; }}
+        .popup-content {{ font-family: sans-serif; font-size: 12px; line-height: 1.5; color: #333; }}
     </style>
 </head>
 <body>
@@ -609,90 +799,88 @@ def create_3Dviz(result_dir, buildings_layer, farmland_layer=None, green_layer=N
 <script>
 const map = new maplibregl.Map({{
     container: 'map',
-    style: 'https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json',
+    style: {style_js},
     center: {json.dumps(center_coords)},
     zoom: 16,
     pitch: 60,
     antialias: true
 }});
 
-// Enable rotate + pitch
-map.addControl(new maplibregl.NavigationControl({{
-    visualizePitch: true
-}}), 'top-right');
-
 map.on('load', () => {{
+    map.addControl(new maplibregl.NavigationControl({{ visualizePitch: true }}), 'top-right');
+
     // Add Sources
+    map.addSource('roads', {{ type: 'geojson', data: {json.dumps(road_data)} }});
     map.addSource('water', {{ type: 'geojson', data: {json.dumps(water_data)} }});
     map.addSource('green', {{ type: 'geojson', data: {json.dumps(green_data)} }});
     map.addSource('bus', {{ type: 'geojson', data: {json.dumps(bus_data)} }});
     map.addSource('buildings', {{ type: 'geojson', data: {json.dumps(building_data)} }});
 
-    // Water
+    // 1. Water
     map.addLayer({{
         id: 'water-layer', type: 'fill', source: 'water',
-        paint: {{ 'fill-color': '#01579b', 'fill-opacity': 0.5 }}
+        paint: {{ 'fill-color': '#01579b', 'fill-opacity': 0.8 }}
     }});
 
-    // Green
+    // 2. Green Space
     map.addLayer({{
         id: 'green-layer', type: 'fill', source: 'green',
-        paint: {{ 'fill-color': '#66bb6a', 'fill-opacity': 0.5 }}
+        paint: {{ 'fill-color': '#2e7d32', 'fill-opacity': 0.4 }}
     }});
 
-    // Bus Routes (Styled by the RGB column you created)
+    // 3. Road Hierarchy (Dark Matter Style)
+    const roadLayers = [
+        {{ id: 'road-motorway', filter: ['==', 'highway', 'motorway'], color: '#666666', width: [8, 1, 14, 6] }},
+        {{ id: 'road-primary', filter: ['==', 'highway', 'primary'], color: '#8b949e', width: [8, 0.75, 14, 4] }},
+        {{ id: 'road-secondary', filter: ['==', 'highway', 'secondary'], color: '#6e7681', width: [9, 0.5, 14, 3] }},
+        {{ id: 'road-tertiary', filter: ['==', 'highway', 'tertiary'], color: '#5a5f66', width: [10, 0.4, 14, 2.5] }},
+        {{ id: 'road-residential', filter: ['==', 'highway', 'residential'], color: '#444c56', width: [11, 0.3, 16, 2] }},
+        {{ id: 'road-service', filter: ['in', 'highway', 'service', 'track', 'minor', 'motorway_link'], color: '#363b42', width: [12, 0.25, 16, 1] }}
+    ];
+
+    roadLayers.forEach(layer => {{
+        map.addLayer({{
+            'id': layer.id, 'type': 'line', 'source': 'roads',
+            'filter': layer.filter,
+            'paint': {{
+                'line-color': layer.color,
+                'line-width': ['interpolate', ['linear'], ['zoom'], ...layer.width]
+            }}
+        }});
+    }});
+
+    // 4. Bus/BRT Routes (Focus Layer)
     map.addLayer({{
-        id: 'bus-layer',
-        type: 'line',
-        source: 'bus',
+        id: 'bus-layer', type: 'line', source: 'bus',
         layout: {{ 'line-join': 'round', 'line-cap': 'round' }},
         paint: {{
-            'line-color': [
-                'case',
-                ['has', 'colour'],
-                ['rgb', ['at', 0, ['get', 'colour']], ['at', 1, ['get', 'colour']], ['at', 2, ['get', 'colour']]],
-                '#FF4500'
-            ],
-            'line-width': 3
+            'line-color': ['case', ['has', 'colour'], ['get', 'colour'], '#FF4500'],
+            'line-width': 4
         }}
     }});
 
-    // 3D Buildings
+    // 5. 3D Buildings
     map.addLayer({{
-        id: '3d-buildings',
-        type: 'fill-extrusion',
-        source: 'buildings',
+        id: '3d-buildings', type: 'fill-extrusion', source: 'buildings',
         paint: {{
-            'fill-extrusion-color': [
-                'case',
-                ['has', 'fill_color'],
-                ['rgb', ['at', 0, ['get', 'fill_color']], ['at', 1, ['get', 'fill_color']], ['at', 2, ['get', 'fill_color']]],
-                '#aaaaaa'
-            ],
+            'fill-extrusion-color': ['case', ['has', 'fill_color'], ['get', 'fill_color'], '#aaaaaa'],
             'fill-extrusion-height': ['coalesce', ['to-number', ['get', 'building_height']], 10],
-            'fill-extrusion-opacity': 0.65
+            'fill-extrusion-base': 0,
+            'fill-extrusion-opacity': 0.8
         }}
     }});
 
-    // Simple Click Popup (Buildings Only)
+    // Click Interaction
     map.on('click', '3d-buildings', (e) => {{
         const p = e.features[0].properties;
-        const html = `
-            <div class="popup-content">
-                <strong>Building:</strong> ${'{'}p.building || 'N/A'{'}'}<br><hr>
-                <strong>Address:</strong> ${'{'}p.address || 'N/A'{'}'}<br>
-                <strong>Plus Code:</strong> ${'{'}p.plus_code || 'N/A'{'}'}<br>
-                <strong>Height:</strong> ${'{'}p.building_height || 0{'}'} m
-            </div>`;
-
-        new maplibregl.Popup()
-            .setLngLat(e.lngLat)
-            .setHTML(html)
-            .addTo(map);
+        const content = '<div class="popup-content">' +
+                '<strong>Building:</strong> ' + (p.building || 'N/A') + '<br><hr>' +
+                '<strong>Address:</strong> ' + (p.address || 'N/A') + '<br>' +
+                '<strong>Height:</strong> ' + (p.building_height || 0) + 'm<br>' +
+                '<strong>Plus Code:</strong> ' + (p.plus_code || 'N/A') +
+            '</div>';
+        new maplibregl.Popup().setLngLat(e.lngLat).setHTML(content).addTo(map);
     }});
-
-    map.on('mouseenter', '3d-buildings', () => {{ map.getCanvas().style.cursor = 'pointer'; }});
-    map.on('mouseleave', '3d-buildings', () => {{ map.getCanvas().style.cursor = ''; }});
 }});
 </script>
 </body>
@@ -700,8 +888,9 @@ map.on('load', () => {{
 """
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html_content)
+    
     return html_path
-
+    
 def get_utm_crs(gdf):
     # 1. Calculate center point to determine UTM zone
     # We use WGS84 coordinates for the calculation
@@ -730,7 +919,7 @@ def get_utm_crs(gdf):
 
 def q_solar(large, focus):
     """Harvest solar (power=generator) and add to project."""
-    name = f"Solar_{focus}"
+    name = f"solar_{focus}"
     query = (f'[out:json][timeout:180];area[name="{large}"]->.L;area[name="{focus}"](area.L)->.a;(way["power"="generator"]["generator:source"="solar"](area.a););out geom;')
     data = _fetch_overpass(query)
     vlayer = QgsVectorLayer(json.dumps(_parse_to_geojson(data, "Polygon")), name, "ogr")
@@ -750,7 +939,7 @@ def read_vsimem_geojson(vsimem_path):
 
 def _harvestSolar(input_pbf, focus, aoi_layer, epsg):
     """
-    Harvests solar data. 
+    Harvests solar data and CLIPS it to the AOI.
     Returns: GeoDataFrame in projected CRS (epsg).
     Displays: QGIS Memory Layer in WGS84 (EPSG:4326).
     """
@@ -790,23 +979,35 @@ def _harvestSolar(input_pbf, focus, aoi_layer, epsg):
     gdf_lines = read_vsimem_geojson(geojson_lines)
     if not gdf_lines.empty: all_solar_gdfs.append(gdf_lines)
 
-    # --- 3. Combine and Cleanup GDAL ---
+    # --- 3. Combine, Clip, and Cleanup ---
     if not all_solar_gdfs:
         gdal.Unlink(geojson_poly)
         gdal.Unlink(geojson_lines)
         return gpd.GeoDataFrame(geometry=[], crs=epsg)
 
-    # This is our base data in WGS84 (OSM default)
-    gdf_wgs84 = gpd.GeoDataFrame(pd.concat(all_solar_gdfs, ignore_index=True), crs="EPSG:4326")
+    # Base data in WGS84
+    gdf_wgs84_raw = gpd.GeoDataFrame(pd.concat(all_solar_gdfs, ignore_index=True), crs="EPSG:4326")
+
+    # SPATIAL CLIP LOGIC
+    # Extract QGIS AOI geometry as Shapely object for GeoPandas
+    # We use the union of all features in the AOI layer just in case it has multiple parts
+    aoi_geom_wkt = QgsGeometry.unaryUnion([f.geometry() for f in aoi_layer.getFeatures()]).asWkt()
+    aoi_shapely = shapely.wkt.loads(aoi_geom_wkt)
+    
+    # Clip the harvested data to the AOI boundary
+    gdf_wgs84 = gpd.clip(gdf_wgs84_raw, aoi_shapely).reset_index(drop=True)
 
     gdal.Unlink(geojson_poly)
     gdal.Unlink(geojson_lines)
 
+    # If clipping removed everything, return empty
+    if gdf_wgs84.empty:
+        return gpd.GeoDataFrame(geometry=[], crs=epsg)
+
     # --- 4. Add to QGIS Map View (WGS84) ---
-    layer_name = f"Solar_{focus}"
+    layer_name = f"solar_{focus}"
     _remove_layer_by_name(layer_name)
 
-    # Create memory layer specifically in 4326
     uri = "Polygon?crs=EPSG:4326"
     temp_layer = QgsVectorLayer(uri, layer_name, "memory")
     provider = temp_layer.dataProvider()
@@ -820,6 +1021,7 @@ def _harvestSolar(input_pbf, focus, aoi_layer, epsg):
         if row.geometry:
             fet = QgsFeature()
             fet.setGeometry(QgsGeometry.fromWkt(row.geometry.wkt))
+            # Handle QVariant-like issues by ensuring standard Python types
             fet.setAttributes([str(row[name]) if pd.notnull(row[name]) else None for name in cols])
             features.append(fet)
 
@@ -984,6 +1186,6 @@ def save_to_geopackage(gpkg_path, target_crs_string):
             )
             
             if error == QgsVectorFileWriter.NoError:
-                print(f"✅ Exported: {layer.name()}")
+                print(f" Exported: {layer.name()}")
             else:
-                print(f"❌ Failed {layer.name()}: {message}")
+                print(f" Failed {layer.name()}: {message}")
